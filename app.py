@@ -1,3 +1,12 @@
+import os
+from flask import Flask, request, jsonify
+
+app = Flask(__name__)
+
+@app.get("/health")
+def health():
+    return jsonify(ok=True, service="booking-server")
+
 @app.post("/book_appointment")
 def book_appointment():
     expected = os.getenv("X_API_KEY", "")
@@ -20,3 +29,6 @@ def book_appointment():
         return jsonify(ok=False, error="bad_json"), 400
 
     return jsonify(ok=True, received=data), 200
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
