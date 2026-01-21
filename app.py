@@ -1,5 +1,6 @@
 import os
 import json
+import re
 from flask import Flask, request, jsonify, redirect
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
@@ -14,7 +15,38 @@ GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 REDIRECT_URI = "https://booking-server-u1ep.onrender.com/oauth/callback"
 
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
-TOKEN_FILE = "/tmp/google_token.json"  # Fichier temporaire Render
+TOKEN_FILE = "/tmp/google_token.json"
+
+# === HELPER : Normaliser les chaînes (enlever accents, minuscules, espaces) ===
+def normalize_string(s):
+    """Normalise une chaîne : minuscules, sans accents, sans espaces"""
+    if not s:
+        return ""
+    # Enlever les accents
+    s = s.replace("é", "e").replace("è", "e").replace("ê", "e")
+    s = s.replace("à", "a").replace("â", "a")
+    s = s.replace("ô", "o").replace("ö", "o")
+    s = s.replace("ù", "u").replace("û", "u")
+    s = s.replace("ç", "c")
+    # Minuscules et enlever espaces/underscores
+    s = s.lower().replace(" ", "").replace("_", "").replace("-", "")
+    return s
+
+# === HELPER : Récupérer un champ avec variantes ===
+def get_field(data, *possible_keys, default=None):
+    """
+    Récupère un champ du JSON avec plusieurs variantes possibles
+    Insensible à la casse, aux accents, aux espaces
+    """
+    for key in possible_keys:
+        normalized_key = normalize_string(key)
+        for data_key, value in data.items():
+            if normalize_string(data_key) == normalized_key:
+                # Nettoyer la valeur (strip espaces)
+                if isinstance(value, str):
+                    value = value.strip()
+                return value if value else default
+    return default
 
 # === HEALTH CHECK ===
 @app.route("/health", methods=["GET"])
@@ -59,7 +91,7 @@ def oauth_callback():
     flow.fetch_token(authorization_response=request.url)
     creds = flow.credentials
 
-    # Sauvegarder le token dans un fichier
+    # Sauvegarder le token
     token_data = {
         "token": creds.token,
         "refresh_token": creds.refresh_token,
@@ -100,7 +132,7 @@ def load_google_credentials():
     
     return creds
 
-# === BOOK APPOINTMENT (avec création Google Calendar) ===
+# === BOOK APPOINTMENT ===
 @app.route("/book_appointment", methods=["POST"])
 def book_appointment():
     expected = os.getenv("X_API_KEY", "")
@@ -109,10 +141,13 @@ def book_appointment():
     data = request.get_json(silent=True) or {}
 
     # Logs safe
+    print("=" * 50, flush=True)
     print("BOOK_APPOINTMENT HIT", flush=True)
     print(f"has_expected_key: {bool(expected)} provided_len: {len(provided)}", flush=True)
     print(f"content_type: {request.headers.get('Content-Type')}", flush=True)
-    print(f"fields: {list(data.keys())}", flush=True)
+    print(f"raw_fields: {list(data.keys())}", flush=True)
+    print(f"raw_data: {data}", flush=True)
+    print("=" * 50, flush=True)
 
     # Vérif auth API
     if not expected or provided != expected:
@@ -129,20 +164,80 @@ def book_appointment():
         print("NO GOOGLE AUTH", flush=True)
         return jsonify(ok=False, error="not_authenticated", auth_url=f"{REDIRECT_URI.rsplit('/', 1)[0]}/oauth/start"), 401
 
+    # Récupérer les champs avec TOUTES les variantes possibles
+    customer_name = get_field(
+        data,
+        "customer_name", "customername", "nom", "name", "client", "prenom", "fullname",
+        default="Client"
+    )
+    
+    service_type = get_field(
+        data,
+        "service", "prestation", "type", "service_type", "servicetype",
+        default="Prestation"
+    )
+    
+    phone = get_field(
+        data,
+        "phone", "telephone", "tel", "numero", "number", "mobile", "portable",
+        default="Non fourni"
+    )
+    
+    notes = get_field(
+        data,
+        "notes", "remarques", "commentaire", "comment", "info", "informations",
+        default=""
+    )
+    
+    start_time = get_field(
+        data,
+        "start_time", "starttime", "date", "datetime", "start", "heure", "horaire"
+    )
+
+    print(f"PARSED FIELDS:", flush=True)
+    print(f"  customer_name: {customer_name}", flush=True)
+    print(f"  service: {service_type}", flush=True)
+    print(f"  phone: {phone}", flush=True)
+    print(f"  notes: {notes}", flush=True)
+    print(f"  start_time: {start_time}", flush=True)
+
+    if not start_time:
+        print("ERROR: NO START_TIME", flush=True)
+        return jsonify(ok=False, error="missing_start_time"), 400
+
     # Créer l'événement Google Calendar
     try:
         service = build("calendar", "v3", credentials=creds)
 
+        # Parser la date (gérer plusieurs formats)
+        try:
+            # Format ISO standard
+            start_dt = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
+        except:
+            try:
+                # Format sans timezone
+                start_dt = datetime.fromisoformat(start_time)
+            except:
+                print(f"ERROR: Invalid date format: {start_time}", flush=True)
+                return jsonify(ok=False, error="invalid_date_format"), 400
+
         # Calculer l'heure de fin (+1h par défaut)
-        start_time = data.get("start_time")
-        start_dt = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
         end_dt = start_dt + timedelta(hours=1)
 
+        # Construire la description
+        description_parts = [f"Client: {customer_name}"]
+        if phone and phone != "Non fourni":
+            description_parts.append(f"Téléphone: {phone}")
+        if notes:
+            description_parts.append(f"Notes: {notes}")
+        
+        description = "\n".join(description_parts)
+
         event = {
-            "summary": f"RDV {data.get('service', 'Prestation')} - {data.get('customer_name', 'Client')}",
-            "description": f"Client: {data.get('customer_name')}\nTéléphone: {data.get('phone', 'Non fourni')}\nNotes: {data.get('notes', 'Aucune')}",
+            "summary": f"RDV {service_type} - {customer_name}",
+            "description": description,
             "start": {
-                "dateTime": start_time,
+                "dateTime": start_dt.isoformat(),
                 "timeZone": "Europe/Paris",
             },
             "end": {
@@ -151,19 +246,27 @@ def book_appointment():
             },
         }
 
+        print(f"CREATING EVENT: {event['summary']}", flush=True)
+
         created_event = service.events().insert(calendarId="primary", body=event).execute()
 
-        print(f"EVENT CREATED: {created_event.get('id')}", flush=True)
+        event_id = created_event.get("id")
+        event_link = created_event.get("htmlLink")
+
+        print(f"✅ EVENT CREATED: {event_id}", flush=True)
+        print(f"   Link: {event_link}", flush=True)
 
         return jsonify(
             ok=True,
             message="Rendez-vous créé avec succès",
-            event_id=created_event.get("id"),
-            event_link=created_event.get("htmlLink"),
+            event_id=event_id,
+            event_link=event_link,
         ), 200
 
     except Exception as e:
-        print(f"CALENDAR ERROR: {str(e)}", flush=True)
+        print(f"❌ CALENDAR ERROR: {str(e)}", flush=True)
+        import traceback
+        print(traceback.format_exc(), flush=True)
         return jsonify(ok=False, error="calendar_failed", details=str(e)), 500
 
 # === LANCER LE SERVEUR ===
