@@ -224,6 +224,46 @@ def book_appointment():
         # Calculer l'heure de fin (+1h par défaut)
         end_dt = start_dt + timedelta(hours=1)
 
+        # === VÉRIFIER LES DISPONIBILITÉS ===
+        print(f"CHECKING AVAILABILITY: {start_dt.isoformat()} - {end_dt.isoformat()}", flush=True)
+        
+        # Récupérer tous les événements qui chevauchent ce créneau
+        events_result = service.events().list(
+            calendarId="primary",
+            timeMin=start_dt.isoformat(),
+            timeMax=end_dt.isoformat(),
+            singleEvents=True,
+            orderBy="startTime"
+        ).execute()
+        
+        existing_events = events_result.get("items", [])
+        num_existing = len(existing_events)
+        
+        print(f"EXISTING EVENTS IN SLOT: {num_existing}", flush=True)
+        
+        # Limite : 3 coiffeurs max
+        MAX_CONCURRENT_APPOINTMENTS = 3
+        
+        if num_existing >= MAX_CONCURRENT_APPOINTMENTS:
+            # Créneau complet (3 RDV déjà pris)
+            print(f"❌ SLOT FULL: {num_existing}/{MAX_CONCURRENT_APPOINTMENTS} appointments", flush=True)
+            
+            # Liste des RDV existants (pour debug)
+            existing_summaries = [e.get("summary", "RDV") for e in existing_events]
+            print(f"   Existing: {', '.join(existing_summaries)}", flush=True)
+            
+            return jsonify(
+                ok=False,
+                error="slot_full",
+                message=f"Ce créneau est complet ({num_existing} rendez-vous déjà pris). Nous avons 3 coiffeurs disponibles.",
+                num_existing=num_existing,
+                max_capacity=MAX_CONCURRENT_APPOINTMENTS,
+                requested_time=start_time
+            ), 409  # 409 = Conflict
+        
+        # === CRÉNEAU DISPONIBLE : CRÉER LE RDV ===
+        print(f"✅ SLOT AVAILABLE: {num_existing}/{MAX_CONCURRENT_APPOINTMENTS} appointments", flush=True)
+
         # Construire la description
         description_parts = [f"Client: {customer_name}"]
         if phone and phone != "Non fourni":
