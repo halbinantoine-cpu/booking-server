@@ -1,6 +1,5 @@
 import os
 import json
-import re
 from flask import Flask, request, jsonify, redirect
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
@@ -85,22 +84,22 @@ def oauth_callback():
         "client_secret": creds.client_secret,
         "scopes": creds.scopes,
     }
-    
+
     with open(TOKEN_FILE, "w") as f:
         json.dump(token_data, f)
-    
+
     print("GOOGLE TOKEN SAVED", flush=True)
     return jsonify(ok=True, message="Authentification réussie ! Tu peux fermer cette page."), 200
 
 def load_google_credentials():
     if not os.path.exists(TOKEN_FILE):
         return None
-    
+
     with open(TOKEN_FILE, "r") as f:
         token_data = json.load(f)
-    
+
     creds = Credentials(**token_data)
-    
+
     if creds.expired and creds.refresh_token:
         from google.auth.transport.requests import Request
         creds.refresh(Request())
@@ -108,7 +107,7 @@ def load_google_credentials():
         with open(TOKEN_FILE, "w") as f:
             json.dump(token_data, f)
         print("GOOGLE TOKEN REFRESHED", flush=True)
-    
+
     return creds
 
 @app.route("/book_appointment", methods=["POST"])
@@ -144,25 +143,25 @@ def book_appointment():
         "customer_name", "customername", "nom", "name", "client", "prenom", "fullname",
         default="Client"
     )
-    
+
     service_type = get_field(
         data,
         "service", "prestation", "type", "service_type", "servicetype",
         default="Prestation"
     )
-    
+
     phone = get_field(
         data,
         "phone", "telephone", "tel", "numero", "number", "mobile", "portable",
         default="Non fourni"
     )
-    
+
     notes = get_field(
         data,
         "notes", "remarques", "commentaire", "comment", "info", "informations",
         default=""
     )
-    
+
     start_time = get_field(
         data,
         "start_time", "starttime", "date", "datetime", "start", "heure", "horaire"
@@ -194,7 +193,7 @@ def book_appointment():
         end_dt = start_dt + timedelta(hours=1)
 
         print(f"CHECKING AVAILABILITY: {start_dt.isoformat()} - {end_dt.isoformat()}", flush=True)
-        
+
         events_result = service.events().list(
             calendarId="primary",
             timeMin=start_dt.isoformat(),
@@ -202,19 +201,19 @@ def book_appointment():
             singleEvents=True,
             orderBy="startTime"
         ).execute()
-        
+
         existing_events = events_result.get("items", [])
         num_existing = len(existing_events)
-        
+
         print(f"EXISTING EVENTS IN SLOT: {num_existing}", flush=True)
-        
+
         MAX_CONCURRENT_APPOINTMENTS = 3
-        
+
         if num_existing >= MAX_CONCURRENT_APPOINTMENTS:
             print(f"SLOT FULL: {num_existing}/{MAX_CONCURRENT_APPOINTMENTS}", flush=True)
             existing_summaries = [e.get("summary", "RDV") for e in existing_events]
             print(f"Existing: {', '.join(existing_summaries)}", flush=True)
-            
+
             return jsonify(
                 ok=False,
                 error="slot_full",
@@ -231,7 +230,7 @@ def book_appointment():
             description_parts.append(f"Téléphone: {phone}")
         if notes:
             description_parts.append(f"Notes: {notes}")
-        
+
         description = "\n".join(description_parts)
 
         event = {
@@ -271,6 +270,39 @@ def book_appointment():
         return jsonify(ok=False, error="calendar_failed", details=str(e)), 500
 
 
+# ========================================
+# TRANSFERT D'APPEL
+# ========================================
+@app.route("/transfer", methods=["POST"])
+def transfer_call():
+    expected = os.getenv("X_API_KEY", "")
+    provided = request.headers.get("X-API-Key", "")
+
+    print("=" * 50, flush=True)
+    print("TRANSFER HIT", flush=True)
+    print("=" * 50, flush=True)
+
+    if not expected or provided != expected:
+        print("TRANSFER AUTH FAIL", flush=True)
+        return jsonify(ok=False, error="unauthorized"), 401
+
+    data = request.get_json(silent=True) or {}
+    phone_number = get_field(data, "phone_number", "phonenumber", "numero", "number", default="+33633327113")
+
+    print(f"TRANSFERRING TO: {phone_number}", flush=True)
+
+    twiml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say voice="Polly.Celine" language="fr-FR">Je vous transfère immédiatement.</Say>
+    <Dial timeout="30">{phone_number}</Dial>
+</Response>"""
+
+    print("TRANSFER TwiML GENERATED", flush=True)
+
+    return twiml_response, 200, {'Content-Type': 'text/xml'}
+
+
+# === LANCER LE SERVEUR ===
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
