@@ -211,9 +211,9 @@ def book_appointment():
         MAX_CONCURRENT_APPOINTMENTS = 3
         
         if num_existing >= MAX_CONCURRENT_APPOINTMENTS:
-            print(f"SLOT FULL: {num_existing}/{MAX_CONCURRENT_APPOINTMENTS} appointments", flush=True)
+            print(f"SLOT FULL: {num_existing}/{MAX_CONCURRENT_APPOINTMENTS}", flush=True)
             existing_summaries = [e.get("summary", "RDV") for e in existing_events]
-            print(f"   Existing: {', '.join(existing_summaries)}", flush=True)
+            print(f"Existing: {', '.join(existing_summaries)}", flush=True)
             
             return jsonify(
                 ok=False,
@@ -224,7 +224,7 @@ def book_appointment():
                 requested_time=start_time
             ), 409
 
-        print(f"SLOT AVAILABLE: {num_existing}/{MAX_CONCURRENT_APPOINTMENTS} appointments", flush=True)
+        print(f"SLOT AVAILABLE: {num_existing}/{MAX_CONCURRENT_APPOINTMENTS}", flush=True)
 
         description_parts = [f"Client: {customer_name}"]
         if phone and phone != "Non fourni":
@@ -255,7 +255,7 @@ def book_appointment():
         event_link = created_event.get("htmlLink")
 
         print(f"EVENT CREATED: {event_id}", flush=True)
-        print(f"   Link: {event_link}", flush=True)
+        print(f"Link: {event_link}", flush=True)
 
         return jsonify(
             ok=True,
@@ -271,39 +271,6 @@ def book_appointment():
         return jsonify(ok=False, error="calendar_failed", details=str(e)), 500
 
 
-# ========================================
-# TRANSFERT D'APPEL
-# ========================================
-@app.route("/transfer", methods=["POST"])
-def transfer_call():
-    expected = os.getenv("X_API_KEY", "")
-    provided = request.headers.get("X-API-Key", "")
-
-    print("=" * 50, flush=True)
-    print("TRANSFER HIT", flush=True)
-    print("=" * 50, flush=True)
-
-    if not expected or provided != expected:
-        print("TRANSFER AUTH FAIL", flush=True)
-        return jsonify(ok=False, error="unauthorized"), 401
-
-    data = request.get_json(silent=True) or {}
-    phone_number = get_field(data, "phone_number", "phonenumber", "numero", "number", default="+33633327113")
-
-    print(f"TRANSFERRING TO: {phone_number}", flush=True)
-
-    twiml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say voice="Polly.Celine" language="fr-FR">Je vous transfère immédiatement.</Say>
-    <Dial timeout="30">{phone_number}</Dial>
-</Response>"""
-
-    print("TRANSFER TwiML GENERATED", flush=True)
-
-    return twiml_response, 200, {'Content-Type': 'text/xml'}
-
-
-# === LANCER LE SERVEUR ===
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
