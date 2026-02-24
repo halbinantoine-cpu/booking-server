@@ -9,7 +9,6 @@ from datetime import datetime, timedelta
 
 app = Flask(__name__)
 
-# Config Google OAuth
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 REDIRECT_URI = "https://booking-server-u1ep.onrender.com/oauth/callback"
@@ -17,43 +16,31 @@ REDIRECT_URI = "https://booking-server-u1ep.onrender.com/oauth/callback"
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 TOKEN_FILE = "/tmp/google_token.json"
 
-# === HELPER : Normaliser les chaînes (enlever accents, minuscules, espaces) ===
 def normalize_string(s):
-    """Normalise une chaîne : minuscules, sans accents, sans espaces"""
     if not s:
         return ""
-    # Enlever les accents
     s = s.replace("é", "e").replace("è", "e").replace("ê", "e")
     s = s.replace("à", "a").replace("â", "a")
     s = s.replace("ô", "o").replace("ö", "o")
     s = s.replace("ù", "u").replace("û", "u")
     s = s.replace("ç", "c")
-    # Minuscules et enlever espaces/underscores
     s = s.lower().replace(" ", "").replace("_", "").replace("-", "")
     return s
 
-# === HELPER : Récupérer un champ avec variantes ===
 def get_field(data, *possible_keys, default=None):
-    """
-    Récupère un champ du JSON avec plusieurs variantes possibles
-    Insensible à la casse, aux accents, aux espaces
-    """
     for key in possible_keys:
         normalized_key = normalize_string(key)
         for data_key, value in data.items():
             if normalize_string(data_key) == normalized_key:
-                # Nettoyer la valeur (strip espaces)
                 if isinstance(value, str):
                     value = value.strip()
                 return value if value else default
     return default
 
-# === HEALTH CHECK ===
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify(ok=True, service="booking-server"), 200
 
-# === OAUTH : Démarrer l'auth ===
 @app.route("/oauth/start", methods=["GET"])
 def oauth_start():
     flow = Flow.from_client_config(
@@ -72,7 +59,6 @@ def oauth_start():
     auth_url, _ = flow.authorization_url(prompt="consent", access_type="offline")
     return redirect(auth_url)
 
-# === OAUTH : Callback après autorisation ===
 @app.route("/oauth/callback", methods=["GET"])
 def oauth_callback():
     flow = Flow.from_client_config(
@@ -91,7 +77,6 @@ def oauth_callback():
     flow.fetch_token(authorization_response=request.url)
     creds = flow.credentials
 
-    # Sauvegarder le token
     token_data = {
         "token": creds.token,
         "refresh_token": creds.refresh_token,
@@ -105,10 +90,8 @@ def oauth_callback():
         json.dump(token_data, f)
     
     print("GOOGLE TOKEN SAVED", flush=True)
-
     return jsonify(ok=True, message="Authentification réussie ! Tu peux fermer cette page."), 200
 
-# === Charger le token Google ===
 def load_google_credentials():
     if not os.path.exists(TOKEN_FILE):
         return None
@@ -118,21 +101,16 @@ def load_google_credentials():
     
     creds = Credentials(**token_data)
     
-    # Rafraîchir le token si expiré
     if creds.expired and creds.refresh_token:
         from google.auth.transport.requests import Request
         creds.refresh(Request())
-        
-        # Sauvegarder le nouveau token
         token_data["token"] = creds.token
         with open(TOKEN_FILE, "w") as f:
             json.dump(token_data, f)
-        
         print("GOOGLE TOKEN REFRESHED", flush=True)
     
     return creds
 
-# === BOOK APPOINTMENT ===
 @app.route("/book_appointment", methods=["POST"])
 def book_appointment():
     expected = os.getenv("X_API_KEY", "")
@@ -140,7 +118,6 @@ def book_appointment():
 
     data = request.get_json(silent=True) or {}
 
-    # Logs safe
     print("=" * 50, flush=True)
     print("BOOK_APPOINTMENT HIT", flush=True)
     print(f"has_expected_key: {bool(expected)} provided_len: {len(provided)}", flush=True)
@@ -149,7 +126,6 @@ def book_appointment():
     print(f"raw_data: {data}", flush=True)
     print("=" * 50, flush=True)
 
-    # Vérif auth API
     if not expected or provided != expected:
         print("AUTH FAIL", flush=True)
         return jsonify(ok=False, error="unauthorized"), 401
@@ -158,13 +134,11 @@ def book_appointment():
         print("NO JSON", flush=True)
         return jsonify(ok=False, error="bad_json"), 400
 
-    # Charger les credentials Google
     creds = load_google_credentials()
     if not creds:
         print("NO GOOGLE AUTH", flush=True)
         return jsonify(ok=False, error="not_authenticated", auth_url=f"{REDIRECT_URI.rsplit('/', 1)[0]}/oauth/start"), 401
 
-    # Récupérer les champs avec TOUTES les variantes possibles
     customer_name = get_field(
         data,
         "customer_name", "customername", "nom", "name", "client", "prenom", "fullname",
@@ -205,29 +179,22 @@ def book_appointment():
         print("ERROR: NO START_TIME", flush=True)
         return jsonify(ok=False, error="missing_start_time"), 400
 
-    # Créer l'événement Google Calendar
     try:
         service = build("calendar", "v3", credentials=creds)
 
-        # Parser la date (gérer plusieurs formats)
         try:
-            # Format ISO standard
             start_dt = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
         except:
             try:
-                # Format sans timezone
                 start_dt = datetime.fromisoformat(start_time)
             except:
                 print(f"ERROR: Invalid date format: {start_time}", flush=True)
                 return jsonify(ok=False, error="invalid_date_format"), 400
 
-        # Calculer l'heure de fin (+1h par défaut)
         end_dt = start_dt + timedelta(hours=1)
 
-        # === VÉRIFIER LES DISPONIBILITÉS ===
         print(f"CHECKING AVAILABILITY: {start_dt.isoformat()} - {end_dt.isoformat()}", flush=True)
         
-        # Récupérer tous les événements qui chevauchent ce créneau
         events_result = service.events().list(
             calendarId="primary",
             timeMin=start_dt.isoformat(),
@@ -241,14 +208,10 @@ def book_appointment():
         
         print(f"EXISTING EVENTS IN SLOT: {num_existing}", flush=True)
         
-        # Limite : 3 coiffeurs max
         MAX_CONCURRENT_APPOINTMENTS = 3
         
         if num_existing >= MAX_CONCURRENT_APPOINTMENTS:
-            # Créneau complet (3 RDV déjà pris)
-            print(f"❌ SLOT FULL: {num_existing}/{MAX_CONCURRENT_APPOINTMENTS} appointments", flush=True)
-            
-            # Liste des RDV existants (pour debug)
+            print(f"SLOT FULL: {num_existing}/{MAX_CONCURRENT_APPOINTMENTS} appointments", flush=True)
             existing_summaries = [e.get("summary", "RDV") for e in existing_events]
             print(f"   Existing: {', '.join(existing_summaries)}", flush=True)
             
@@ -259,12 +222,10 @@ def book_appointment():
                 num_existing=num_existing,
                 max_capacity=MAX_CONCURRENT_APPOINTMENTS,
                 requested_time=start_time
-            ), 409  # 409 = Conflict
-        
-        # === CRÉNEAU DISPONIBLE : CRÉER LE RDV ===
-        print(f"✅ SLOT AVAILABLE: {num_existing}/{MAX_CONCURRENT_APPOINTMENTS} appointments", flush=True)
+            ), 409
 
-        # Construire la description
+        print(f"SLOT AVAILABLE: {num_existing}/{MAX_CONCURRENT_APPOINTMENTS} appointments", flush=True)
+
         description_parts = [f"Client: {customer_name}"]
         if phone and phone != "Non fourni":
             description_parts.append(f"Téléphone: {phone}")
@@ -293,7 +254,7 @@ def book_appointment():
         event_id = created_event.get("id")
         event_link = created_event.get("htmlLink")
 
-        print(f"✅ EVENT CREATED: {event_id}", flush=True)
+        print(f"EVENT CREATED: {event_id}", flush=True)
         print(f"   Link: {event_link}", flush=True)
 
         return jsonify(
@@ -304,11 +265,45 @@ def book_appointment():
         ), 200
 
     except Exception as e:
-        print(f"❌ CALENDAR ERROR: {str(e)}", flush=True)
+        print(f"CALENDAR ERROR: {str(e)}", flush=True)
         import traceback
         print(traceback.format_exc(), flush=True)
         return jsonify(ok=False, error="calendar_failed", details=str(e)), 500
 
+
+# ========================================
+# TRANSFERT D'APPEL
+# ========================================
+@app.route("/transfer", methods=["POST"])
+def transfer_call():
+    expected = os.getenv("X_API_KEY", "")
+    provided = request.headers.get("X-API-Key", "")
+
+    print("=" * 50, flush=True)
+    print("TRANSFER HIT", flush=True)
+    print("=" * 50, flush=True)
+
+    if not expected or provided != expected:
+        print("TRANSFER AUTH FAIL", flush=True)
+        return jsonify(ok=False, error="unauthorized"), 401
+
+    data = request.get_json(silent=True) or {}
+    phone_number = get_field(data, "phone_number", "phonenumber", "numero", "number", default="+33633327113")
+
+    print(f"TRANSFERRING TO: {phone_number}", flush=True)
+
+    twiml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say voice="Polly.Celine" language="fr-FR">Je vous transfère immédiatement.</Say>
+    <Dial timeout="30">{phone_number}</Dial>
+</Response>"""
+
+    print("TRANSFER TwiML GENERATED", flush=True)
+
+    return twiml_response, 200, {'Content-Type': 'text/xml'}
+
+
 # === LANCER LE SERVEUR ===
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=True)
