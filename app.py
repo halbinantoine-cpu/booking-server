@@ -1,13 +1,17 @@
 import os
 import json
-from flask import Flask, request, jsonify, redirect
+import secrets
+import hashlib
+import base64
+from flask import Flask, request, jsonify, redirect, session
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from datetime import datetime, timedelta
 import pytz
+import requests as req
 
 app = Flask(__name__)
+app.secret_key = os.getenv("SECRET_KEY", "supersecretkey123")
 
 # === CONFIGURATION ===
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
@@ -42,65 +46,61 @@ def oauth_start():
     if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
         return jsonify(ok=False, error="missing_google_credentials"), 500
 
-    flow = Flow.from_client_config(
-        {
-            "web": {
-                "client_id": GOOGLE_CLIENT_ID,
-                "client_secret": GOOGLE_CLIENT_SECRET,
-                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                "token_uri": "https://oauth2.googleapis.com/token",
-                "redirect_uris": [REDIRECT_URI],
-            }
-        },
-        scopes=SCOPES,
-        redirect_uri=REDIRECT_URI,
-    )
+    code_verifier = secrets.token_urlsafe(64)
+    code_challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(code_verifier.encode()).digest()
+    ).rstrip(b"=").decode()
 
-    auth_url, state = flow.authorization_url(prompt="consent", access_type="offline")
-    # Sauvegarde le state pour vérification dans le callback
-    os.environ["OAUTH_STATE"] = state
+    session["code_verifier"] = code_verifier
+
+    from urllib.parse import urlencode
+    params = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": REDIRECT_URI,
+        "response_type": "code",
+        "scope": " ".join(SCOPES),
+        "access_type": "offline",
+        "prompt": "consent",
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+    }
+
+    auth_url = "https://accounts.google.com/o/oauth2/auth?" + urlencode(params)
     return redirect(auth_url)
 
 @app.route("/oauth/callback", methods=["GET"])
 def oauth_callback():
-    # ✅ CORRECTION PKCE : utilise authorization_response au lieu de code seul
-    os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
+    code = request.args.get("code")
+    if not code:
+        return jsonify(ok=False, error="no_code"), 400
 
-    state = request.args.get("state")
-    if not state:
-        return jsonify(ok=False, error="missing_state"), 400
+    code_verifier = session.get("code_verifier")
+    if not code_verifier:
+        return jsonify(ok=False, error="missing_code_verifier"), 400
 
-    flow = Flow.from_client_config(
-        {
-            "web": {
-                "client_id": GOOGLE_CLIENT_ID,
-                "client_secret": GOOGLE_CLIENT_SECRET,
-                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                "token_uri": "https://oauth2.googleapis.com/token",
-                "redirect_uris": [REDIRECT_URI],
-            }
-        },
-        scopes=SCOPES,
-        state=state,
-        redirect_uri=REDIRECT_URI,
-    )
+    token_response = req.post("https://oauth2.googleapis.com/token", data={
+        "client_id": GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "code": code,
+        "code_verifier": code_verifier,
+        "grant_type": "authorization_code",
+        "redirect_uri": REDIRECT_URI,
+    })
 
-    # Utilise l'URL complète — résout l'erreur "code verifier manquant"
-    flow.fetch_token(authorization_response=request.url)
+    token_data = token_response.json()
 
-    creds = flow.credentials
-
-    token_data = {
-        "token": creds.token,
-        "refresh_token": creds.refresh_token,
-        "token_uri": creds.token_uri,
-        "client_id": creds.client_id,
-        "client_secret": creds.client_secret,
-        "scopes": list(creds.scopes) if creds.scopes else SCOPES,
-    }
+    if "error" in token_data:
+        return jsonify(ok=False, error=token_data["error"]), 400
 
     with open(TOKEN_FILE, "w") as f:
-        json.dump(token_data, f)
+        json.dump({
+            "token": token_data.get("access_token"),
+            "refresh_token": token_data.get("refresh_token"),
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "scopes": SCOPES,
+        }, f)
 
     print("GOOGLE TOKEN SAVED", flush=True)
     return "<h2>✅ Authentification réussie ! Tu peux fermer cette page.</h2>", 200
