@@ -41,7 +41,7 @@ def health():
 def oauth_start():
     if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
         return jsonify(ok=False, error="missing_google_credentials"), 500
-    
+
     flow = Flow.from_client_config(
         {
             "web": {
@@ -55,16 +55,21 @@ def oauth_start():
         scopes=SCOPES,
         redirect_uri=REDIRECT_URI,
     )
-    
-    auth_url, _ = flow.authorization_url(prompt="consent", access_type="offline")
+
+    auth_url, state = flow.authorization_url(prompt="consent", access_type="offline")
+    # Sauvegarde le state pour vérification dans le callback
+    os.environ["OAUTH_STATE"] = state
     return redirect(auth_url)
 
 @app.route("/oauth/callback", methods=["GET"])
 def oauth_callback():
-    code = request.args.get("code")
-    if not code:
-        return jsonify(ok=False, error="no_code"), 400
-    
+    # ✅ CORRECTION PKCE : utilise authorization_response au lieu de code seul
+    os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
+
+    state = request.args.get("state")
+    if not state:
+        return jsonify(ok=False, error="missing_state"), 400
+
     flow = Flow.from_client_config(
         {
             "web": {
@@ -76,36 +81,39 @@ def oauth_callback():
             }
         },
         scopes=SCOPES,
+        state=state,
         redirect_uri=REDIRECT_URI,
     )
-    
-    flow.fetch_token(code=code)
+
+    # Utilise l'URL complète — résout l'erreur "code verifier manquant"
+    flow.fetch_token(authorization_response=request.url)
+
     creds = flow.credentials
-    
+
     token_data = {
         "token": creds.token,
         "refresh_token": creds.refresh_token,
         "token_uri": creds.token_uri,
         "client_id": creds.client_id,
         "client_secret": creds.client_secret,
-        "scopes": creds.scopes,
+        "scopes": list(creds.scopes) if creds.scopes else SCOPES,
     }
-    
+
     with open(TOKEN_FILE, "w") as f:
         json.dump(token_data, f)
-    
+
     print("GOOGLE TOKEN SAVED", flush=True)
-    return jsonify(ok=True, message="Authentification réussie ! Tu peux fermer cette page."), 200
+    return "<h2>✅ Authentification réussie ! Tu peux fermer cette page.</h2>", 200
 
 def load_google_credentials():
     if not os.path.exists(TOKEN_FILE):
         return None
-    
+
     with open(TOKEN_FILE, "r") as f:
         token_data = json.load(f)
-    
+
     creds = Credentials(**token_data)
-    
+
     if creds.expired and creds.refresh_token:
         from google.auth.transport.requests import Request
         creds.refresh(Request())
@@ -113,17 +121,17 @@ def load_google_credentials():
         with open(TOKEN_FILE, "w") as f:
             json.dump(token_data, f)
         print("GOOGLE TOKEN REFRESHED", flush=True)
-    
+
     return creds
 
 @app.route("/book_appointment", methods=["POST"])
 def book_appointment():
     expected = os.getenv("X_API_KEY", "")
     provided = request.headers.get("X-API-Key", "")
-    
+
     if not expected or provided != expected:
         return jsonify(ok=False, error="unauthorized"), 401
-    
+
     creds = load_google_credentials()
     if not creds:
         return jsonify(
@@ -131,27 +139,27 @@ def book_appointment():
             error="not_authenticated",
             auth_url="https://booking-server-u1ep.onrender.com/oauth/start"
         ), 401
-    
+
     data = request.get_json(silent=True) or {}
-    
+
     customer_name = get_field(data, "customer_name", "customername", "nom", "name", "client", default="Client")
-    service_type = get_field(data, "service", "prestation", "type", "service_type", default="Prestation")
-    phone = get_field(data, "phone", "telephone", "tel", "numero", "number", default="Non fourni")
-    notes = get_field(data, "notes", "remarques", "commentaire", "comment", default="")
-    start_time = get_field(data, "start_time", "starttime", "date", "datetime", "start")
-    
+    service_type  = get_field(data, "service", "prestation", "type", "service_type", default="Prestation")
+    phone         = get_field(data, "phone", "telephone", "tel", "numero", "number", default="Non fourni")
+    notes         = get_field(data, "notes", "remarques", "commentaire", "comment", default="")
+    start_time    = get_field(data, "start_time", "starttime", "date", "datetime", "start")
+
     if not start_time:
         return jsonify(ok=False, error="missing_start_time"), 400
-    
+
     try:
         service = build("calendar", "v3", credentials=creds)
-        
+
         start_dt = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
         if start_dt.tzinfo is None:
             start_dt = PARIS_TZ.localize(start_dt)
-        
+
         end_dt = start_dt + timedelta(hours=1)
-        
+
         events_result = service.events().list(
             calendarId="primary",
             timeMin=start_dt.isoformat(),
@@ -159,39 +167,39 @@ def book_appointment():
             singleEvents=True,
             orderBy="startTime"
         ).execute()
-        
+
         existing_events = events_result.get("items", [])
         MAX_CONCURRENT = 3
-        
+
         if len(existing_events) >= MAX_CONCURRENT:
             return jsonify(
                 ok=False,
                 error="slot_full",
                 message=f"Ce créneau est complet ({len(existing_events)}/{MAX_CONCURRENT} RDV)"
             ), 409
-        
+
         description_parts = [f"Client: {customer_name}"]
         if phone != "Non fourni":
             description_parts.append(f"Téléphone: {phone}")
         if notes:
             description_parts.append(f"Notes: {notes}")
-        
+
         event = {
             "summary": f"{service_type} – {customer_name}",
             "description": "\n".join(description_parts),
             "start": {"dateTime": start_dt.isoformat(), "timeZone": "Europe/Paris"},
-            "end": {"dateTime": end_dt.isoformat(), "timeZone": "Europe/Paris"},
+            "end":   {"dateTime": end_dt.isoformat(),   "timeZone": "Europe/Paris"},
         }
-        
+
         created_event = service.events().insert(calendarId="primary", body=event).execute()
-        
+
         return jsonify(
             ok=True,
             message="Rendez-vous créé avec succès",
             event_id=created_event.get("id"),
             event_link=created_event.get("htmlLink")
         ), 200
-        
+
     except Exception as e:
         print(f"CALENDAR ERROR: {e}", flush=True)
         return jsonify(ok=False, error="calendar_failed", details=str(e)), 500
