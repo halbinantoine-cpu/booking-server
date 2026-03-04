@@ -3,12 +3,13 @@ import json
 import secrets
 import hashlib
 import base64
+import requests as req
 from flask import Flask, request, jsonify, redirect, session
 from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from datetime import datetime, timedelta
 import pytz
-import requests as req
 
 app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY", "supersecretkey123")
@@ -19,6 +20,9 @@ GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 REDIRECT_URI = os.getenv("REDIRECT_URI", "https://booking-server-u1ep.onrender.com/oauth/callback")
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 TOKEN_FILE = "/tmp/google_token.json"
+
+RENDER_API_KEY = os.getenv("RENDER_API_KEY")
+RENDER_SERVICE_ID = os.getenv("RENDER_SERVICE_ID")
 
 PARIS_TZ = pytz.timezone("Europe/Paris")
 
@@ -36,10 +40,88 @@ def get_field(data, *keys, default=None):
                 return v
     return default
 
+def save_refresh_token_to_render(refresh_token):
+    """Sauvegarde le refresh_token dans les variables d'environnement Render."""
+    if not RENDER_API_KEY or not RENDER_SERVICE_ID:
+        print("RENDER_API_KEY ou RENDER_SERVICE_ID manquant", flush=True)
+        return False
+    try:
+        response = req.put(
+            f"https://api.render.com/v1/services/{RENDER_SERVICE_ID}/env-vars",
+            headers={
+                "Authorization": f"Bearer {RENDER_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json=[{"key": "GOOGLE_REFRESH_TOKEN", "value": refresh_token}]
+        )
+        if response.status_code == 200:
+            print("REFRESH TOKEN SAUVEGARDÉ DANS RENDER", flush=True)
+            return True
+        else:
+            print(f"ERREUR RENDER API: {response.status_code} {response.text}", flush=True)
+            return False
+    except Exception as e:
+        print(f"ERREUR SAVE RENDER: {e}", flush=True)
+        return False
+
+def load_google_credentials():
+    """Charge les credentials depuis /tmp ou depuis la variable d'env GOOGLE_REFRESH_TOKEN."""
+    # 1. Essaie depuis /tmp
+    if os.path.exists(TOKEN_FILE):
+        try:
+            with open(TOKEN_FILE, "r") as f:
+                token_data = json.load(f)
+            creds = Credentials(**token_data)
+            if creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+                token_data["token"] = creds.token
+                with open(TOKEN_FILE, "w") as f:
+                    json.dump(token_data, f)
+                print("GOOGLE TOKEN REFRESHED", flush=True)
+            return creds
+        except Exception as e:
+            print(f"ERREUR LOAD TOKEN FILE: {e}", flush=True)
+
+    # 2. Essaie depuis la variable d'env GOOGLE_REFRESH_TOKEN
+    refresh_token = os.getenv("GOOGLE_REFRESH_TOKEN")
+    if refresh_token:
+        try:
+            creds = Credentials(
+                token=None,
+                refresh_token=refresh_token,
+                token_uri="https://oauth2.googleapis.com/token",
+                client_id=GOOGLE_CLIENT_ID,
+                client_secret=GOOGLE_CLIENT_SECRET,
+                scopes=SCOPES
+            )
+            creds.refresh(Request())
+            # Sauvegarde dans /tmp pour les prochains appels
+            token_data = {
+                "token": creds.token,
+                "refresh_token": creds.refresh_token,
+                "token_uri": creds.token_uri,
+                "client_id": creds.client_id,
+                "client_secret": creds.client_secret,
+                "scopes": SCOPES
+            }
+            with open(TOKEN_FILE, "w") as f:
+                json.dump(token_data, f)
+            print("GOOGLE TOKEN CHARGÉ DEPUIS ENV VAR", flush=True)
+            return creds
+        except Exception as e:
+            print(f"ERREUR LOAD REFRESH TOKEN: {e}", flush=True)
+
+    return None
+
 # === ROUTES ===
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify(ok=True, service="booking-server"), 200
+    token_source = "none"
+    if os.path.exists(TOKEN_FILE):
+        token_source = "file"
+    elif os.getenv("GOOGLE_REFRESH_TOKEN"):
+        token_source = "env_var"
+    return jsonify(ok=True, service="booking-server", token_source=token_source), 200
 
 @app.route("/oauth/start", methods=["GET"])
 def oauth_start():
@@ -90,39 +172,27 @@ def oauth_callback():
     token_data = token_response.json()
 
     if "error" in token_data:
-        return jsonify(ok=False, error=token_data["error"]), 400
+        return jsonify(ok=False, error=token_data["error"], details=token_data), 400
 
+    refresh_token = token_data.get("refresh_token")
+
+    # Sauvegarde dans /tmp
     with open(TOKEN_FILE, "w") as f:
         json.dump({
             "token": token_data.get("access_token"),
-            "refresh_token": token_data.get("refresh_token"),
+            "refresh_token": refresh_token,
             "token_uri": "https://oauth2.googleapis.com/token",
             "client_id": GOOGLE_CLIENT_ID,
             "client_secret": GOOGLE_CLIENT_SECRET,
             "scopes": SCOPES,
         }, f)
 
+    # Sauvegarde permanente dans Render
+    if refresh_token:
+        save_refresh_token_to_render(refresh_token)
+
     print("GOOGLE TOKEN SAVED", flush=True)
     return "<h2>✅ Authentification réussie ! Tu peux fermer cette page.</h2>", 200
-
-def load_google_credentials():
-    if not os.path.exists(TOKEN_FILE):
-        return None
-
-    with open(TOKEN_FILE, "r") as f:
-        token_data = json.load(f)
-
-    creds = Credentials(**token_data)
-
-    if creds.expired and creds.refresh_token:
-        from google.auth.transport.requests import Request
-        creds.refresh(Request())
-        token_data["token"] = creds.token
-        with open(TOKEN_FILE, "w") as f:
-            json.dump(token_data, f)
-        print("GOOGLE TOKEN REFRESHED", flush=True)
-
-    return creds
 
 @app.route("/book_appointment", methods=["POST"])
 def book_appointment():
